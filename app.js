@@ -4144,6 +4144,80 @@ const SHIR_RR_MAX_EXCEL_ROW = 800;
 // Sanity ceiling: no single floor plan ever has this many units in one row.
 const SHIR_RR_MAX_PER_ROW_COUNT = 1000;
 
+// SHIR proforma "RR" tab, template v39+ layout. The unit-mix summary at the top
+// was re-geometried (100-row BR/BA blocks, "Occupied" / "ALL Vacant" / "ALL" /
+// "Grand Tot/Avg" roll-ups at ~702-715, a mirrored VACANTS section at ~1000-1705)
+// and every summary count is now a COUNTIFS over the per-unit rent roll pasted
+// at the bottom of the tab (header "Unit Type Name | Reno/Unreno | Unit # | # BRs
+// | # Ba | Sq. Ft." at ~row 2000, closed by an all-"x" sentinel row). So read
+// that per-unit roll directly: it is the source the summary is computed from,
+// it holds plain values (no dependence on cached formula results), and it needs
+// no row-number skip-list. Columns are located by header label.
+// Detection: a "Unit Name" summary header or a "VACANTS" section marker. Many
+// pre-v39 RR tabs carry the same per-unit roll (lower down, e.g. row 800) and
+// match too — same unit types, counts, statuses and SF as the old summary read,
+// but baths are the units' real counts instead of the summary block label
+// ("1x1(.5)" used to import every 1BR as 1.5 baths). Tabs without a per-unit
+// roll return null so parseSHIRSummaryRR below still handles them.
+function parseSHIRUnitRollRR(wb) {
+  const sheet = wb.Sheets['RR'];
+  if (!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet,
+    { header: 1, blankrows: true, defval: null, range: 'A1:Z5000' });
+  const isNewLayout = rows.some((r, i) => i < 30 && (r || []).some(c => umNorm(c) === 'unitname'))
+    || rows.some(r => (r || []).some(c => umNorm(c) === 'vacants'));
+  if (!isNewLayout) return null;
+  let h = -1, C = null;
+  for (let i = 0; i < rows.length; i++) {
+    const cells = (rows[i] || []).map(umNorm);
+    const type = cells.findIndex(c => c === 'unittypename' || c === 'unittype');
+    const unitNo = cells.findIndex(c => c === 'unit' || c === 'unitno' || c === 'unitnumber');
+    if (type < 0 || unitNo < 0) continue;
+    const find = (re) => cells.findIndex(c => re.test(c));
+    h = i;
+    C = { type, status: find(/reno|status|condition/), beds: find(/^#?brs?$|bed/),
+          baths: find(/^#?bas?$|bath/), sqft: find(/^sqft$|^sf$|squarefe/) };
+    break;
+  }
+  if (h < 0) return null;   // no per-unit roll on this tab → let the older parsers try
+  const agg = new Map();
+  for (let i = h + 1; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const g = (k) => (k >= 0 && k < row.length ? row[k] : null);
+    const type = String(g(C.type) == null ? '' : g(C.type)).trim();
+    if (!type) continue;                       // gaps inside the pasted roll
+    if (type.toLowerCase() === 'x') break;     // end-of-roll sentinel row
+    const status = umStatus(g(C.status));
+    const key = type + '||' + status;
+    let a = agg.get(key);
+    if (!a) { a = { type, status, count: 0, beds: '', baths: '', sqftSum: 0, sqftN: 0 }; agg.set(key, a); }
+    a.count += 1;
+    const b = umNum(g(C.beds));   if (b !== '' && a.beds === '') a.beds = b;
+    const ba = umNum(g(C.baths)); if (ba !== '' && a.baths === '') a.baths = ba;
+    const sf = umNum(g(C.sqft));  if (sf !== '' && sf > 0) { a.sqftSum += sf; a.sqftN += 1; }
+  }
+  // Order like the summary blocks: by beds, baths, SF/unit, then plan and status.
+  const n = (v) => (v === '' || v == null ? Infinity : v);
+  const stRank = { Original: 0, Partial: 1, Reno: 2 };
+  return [...agg.values()].map(a => ({
+    type: a.type, status: a.status, count: a.count, beds: a.beds, baths: a.baths,
+    sqft: a.sqftN ? Math.round(a.sqftSum / a.sqftN) : '',
+  })).sort((x, y) => n(x.beds) - n(y.beds) || n(x.baths) - n(y.baths) || n(x.sqft) - n(y.sqft)
+    || x.type.localeCompare(y.type) || (stRank[x.status] ?? 3) - (stRank[y.status] ?? 3));
+}
+
+// Every proforma import path (file upload, Drive pull, Basics & Units pull)
+// runs this same parser chain, newest layout first. A v39+ RR tab is
+// authoritative: if its rent roll is empty, return nothing rather than let the
+// older loose parsers misread the template (they import the "x" sentinel row).
+function parseUnitMixWorkbook(wb) {
+  const v39 = parseSHIRUnitRollRR(wb);
+  if (v39) return v39.length ? v39 : null;
+  return parseSHIRSummaryRR(wb) || parseUnitsTab(wb)
+    || parseUMixSum(wb) || parseProformaRR(wb) || parseGenericUnitMix(wb);
+}
+
+// Pre-v39 RR summary layout (kept for older deal proformas).
 function parseSHIRSummaryRR(wb) {
   const sheet = wb.Sheets['RR'];
   if (!sheet) return null;
@@ -4425,7 +4499,7 @@ function importProformaUnitMix(file, rebuild) {
   reader.onload = (e) => {
     try {
       const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
-      const out = parseSHIRSummaryRR(wb) || parseUnitsTab(wb) || parseUMixSum(wb) || parseProformaRR(wb) || parseGenericUnitMix(wb);
+      const out = parseUnitMixWorkbook(wb);
       if (!out || !out.length) {
         toast('Could not find unit-mix data (looked for the RR rent roll — see the note).', 'error');
         return;
@@ -4618,7 +4692,7 @@ async function pullProformaFromDrive(rebuild) {
     const r = await driveFetch(url);
     const buf = await r.arrayBuffer();
     const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
-    const out = parseSHIRSummaryRR(wb) || parseUnitsTab(wb) || parseUMixSum(wb) || parseProformaRR(wb) || parseGenericUnitMix(wb);
+    const out = parseUnitMixWorkbook(wb);
     if (!out || !out.length) { toast('Found the file but could not parse a unit mix from its RR tab.', 'error'); return; }
     if (getUnitMix().length && !confirm(`Replace the current ${getUnitMix().length} unit type(s) with ${out.length} from ${f.name}?`)) return;
     replaceUnitMix(out);   // in place — a bare `STATE.unitMix = out` would not persist (view-only)
@@ -4801,7 +4875,7 @@ async function pullBasicsAndUnitsFromDrive() {
     }
 
     // Apply unit mix from RR tab
-    const umOut = parseSHIRSummaryRR(wb) || parseUnitsTab(wb) || parseUMixSum(wb) || parseProformaRR(wb) || parseGenericUnitMix(wb);
+    const umOut = parseUnitMixWorkbook(wb);
     if (umOut && umOut.length) {
       const existingCount = getUnitMix().length;
       if (!existingCount || confirm(`Replace the current ${existingCount} unit type(s) with ${umOut.length} from ${f.name}?`)) {
